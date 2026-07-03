@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+
 const { initializeApp, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 
@@ -20,7 +21,22 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "1mb" }));
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
+
+function getEnvStatus() {
+  return {
+    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    hasFirebaseServiceAccount: Boolean(
+      process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
+    ),
+    geminiModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    allowedOrigin: process.env.ALLOWED_ORIGIN || "*",
+  };
+}
 
 function initFirebaseAdmin() {
   if (getApps().length > 0) {
@@ -33,16 +49,75 @@ function initFirebaseAdmin() {
     throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 env variable.");
   }
 
-  const serviceAccountJson = Buffer.from(
-    serviceAccountBase64,
-    "base64"
-  ).toString("utf8");
+  let serviceAccountJson;
+  let serviceAccount;
 
-  const serviceAccount = JSON.parse(serviceAccountJson);
+  try {
+    serviceAccountJson = Buffer.from(
+      serviceAccountBase64,
+      "base64"
+    ).toString("utf8");
+
+    serviceAccount = JSON.parse(serviceAccountJson);
+  } catch (error) {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_BASE64 is not valid Base64 JSON."
+    );
+  }
+
+  if (!serviceAccount.project_id) {
+    throw new Error(
+      "Firebase service account is missing project_id. Please check serviceAccountKey.json."
+    );
+  }
+
+  if (!serviceAccount.client_email) {
+    throw new Error(
+      "Firebase service account is missing client_email. Please check serviceAccountKey.json."
+    );
+  }
+
+  if (!serviceAccount.private_key) {
+    throw new Error(
+      "Firebase service account is missing private_key. Please check serviceAccountKey.json."
+    );
+  }
 
   return initializeApp({
     credential: cert(serviceAccount),
   });
+}
+
+function getFirebaseServiceAccountInfo() {
+  const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+  if (!serviceAccountBase64) {
+    return {
+      ok: false,
+      error: "FIREBASE_SERVICE_ACCOUNT_BASE64 is missing.",
+    };
+  }
+
+  try {
+    const serviceAccountJson = Buffer.from(
+      serviceAccountBase64,
+      "base64"
+    ).toString("utf8");
+
+    const serviceAccount = JSON.parse(serviceAccountJson);
+
+    return {
+      ok: true,
+      projectId: serviceAccount.project_id || null,
+      clientEmail: serviceAccount.client_email || null,
+      hasPrivateKey: Boolean(serviceAccount.private_key),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+    };
+  }
 }
 
 function getBearerToken(req) {
@@ -59,7 +134,7 @@ async function verifyFirebaseUser(req) {
   const token = getBearerToken(req);
 
   if (!token) {
-    const error = new Error("Missing Firebase authorization token.");
+    const error = new Error("No Authorization Bearer token received by backend.");
     error.statusCode = 401;
     throw error;
   }
@@ -72,9 +147,22 @@ async function verifyFirebaseUser(req) {
     return {
       uid: decodedToken.uid,
       email: decodedToken.email || null,
+      aud: decodedToken.aud || null,
+      iss: decodedToken.iss || null,
+      authTime: decodedToken.auth_time || null,
     };
   } catch (error) {
-    const customError = new Error("Invalid or expired Firebase token.");
+    console.error("Firebase token verification failed:", {
+      code: error.code,
+      message: error.message,
+    });
+
+    const customError = new Error(
+      `Firebase token verification failed: ${error.code || ""} ${
+        error.message || ""
+      }`.trim()
+    );
+
     customError.statusCode = 401;
     throw customError;
   }
@@ -149,7 +237,7 @@ function buildPrompt({ question, journalEntries, user }) {
   return `
 You are SignalFlow AI, a trading journal coach inside a trader app.
 
-Authenticated Firebase user:
+Authenticated Firebase user ID:
 ${user.uid}
 
 Your job:
@@ -185,17 +273,64 @@ function extractGeminiAnswer(data) {
 }
 
 app.get("/", (req, res) => {
-  res.status(200).json({
+  return res.status(200).json({
     success: true,
     message: "TradeMind AI backend is running.",
+    routes: {
+      health: "/health",
+      geminiJournal: "/api/gemini-journal",
+      firebaseDebug: "/debug/firebase",
+      tokenDebug: "/debug/check-token",
+    },
   });
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  return res.status(200).json({
     success: true,
     status: "ok",
+    env: getEnvStatus(),
   });
+});
+
+app.get("/debug/firebase", (req, res) => {
+  const info = getFirebaseServiceAccountInfo();
+
+  return res.status(info.ok ? 200 : 500).json({
+    success: info.ok,
+    firebase: info,
+    env: getEnvStatus(),
+  });
+});
+
+app.post("/debug/check-token", async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: "No Authorization Bearer token received by backend.",
+        hasAuthorizationHeader: Boolean(req.headers.authorization),
+        receivedAuthorizationHeaderStart: req.headers.authorization
+          ? req.headers.authorization.substring(0, 20)
+          : null,
+      });
+    }
+
+    const user = await verifyFirebaseUser(req);
+
+    return res.status(200).json({
+      success: true,
+      message: "Firebase token is valid.",
+      user,
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 401).json({
+      success: false,
+      error: error.message,
+    });
+  }
 });
 
 app.post("/api/gemini-journal", async (req, res) => {
@@ -303,9 +438,10 @@ app.post("/api/gemini-journal", async (req, res) => {
 });
 
 app.use((req, res) => {
-  res.status(404).json({
+  return res.status(404).json({
     success: false,
     error: "Route not found.",
+    path: req.path,
   });
 });
 
