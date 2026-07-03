@@ -1,9 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-
-const { initializeApp, cert, getApps } = require("firebase-admin/app");
-const { getAuth } = require("firebase-admin/auth");
+const admin = require("firebase-admin");
 
 dotenv.config();
 
@@ -38,64 +36,11 @@ function getEnvStatus() {
   };
 }
 
-function initFirebaseAdmin() {
-  if (getApps().length > 0) {
-    return getApps()[0];
-  }
-
+function getServiceAccountFromEnv() {
   const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
   if (!serviceAccountBase64) {
     throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 env variable.");
-  }
-
-  let serviceAccountJson;
-  let serviceAccount;
-
-  try {
-    serviceAccountJson = Buffer.from(
-      serviceAccountBase64,
-      "base64"
-    ).toString("utf8");
-
-    serviceAccount = JSON.parse(serviceAccountJson);
-  } catch (error) {
-    throw new Error(
-      "FIREBASE_SERVICE_ACCOUNT_BASE64 is not valid Base64 JSON."
-    );
-  }
-
-  if (!serviceAccount.project_id) {
-    throw new Error(
-      "Firebase service account is missing project_id. Please check serviceAccountKey.json."
-    );
-  }
-
-  if (!serviceAccount.client_email) {
-    throw new Error(
-      "Firebase service account is missing client_email. Please check serviceAccountKey.json."
-    );
-  }
-
-  if (!serviceAccount.private_key) {
-    throw new Error(
-      "Firebase service account is missing private_key. Please check serviceAccountKey.json."
-    );
-  }
-
-  return initializeApp({
-    credential: cert(serviceAccount),
-  });
-}
-
-function getFirebaseServiceAccountInfo() {
-  const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
-
-  if (!serviceAccountBase64) {
-    return {
-      ok: false,
-      error: "FIREBASE_SERVICE_ACCOUNT_BASE64 is missing.",
-    };
   }
 
   try {
@@ -105,6 +50,42 @@ function getFirebaseServiceAccountInfo() {
     ).toString("utf8");
 
     const serviceAccount = JSON.parse(serviceAccountJson);
+
+    if (!serviceAccount.project_id) {
+      throw new Error("Service account missing project_id.");
+    }
+
+    if (!serviceAccount.client_email) {
+      throw new Error("Service account missing client_email.");
+    }
+
+    if (!serviceAccount.private_key) {
+      throw new Error("Service account missing private_key.");
+    }
+
+    return serviceAccount;
+  } catch (error) {
+    throw new Error(
+      `FIREBASE_SERVICE_ACCOUNT_BASE64 is invalid: ${error.message}`
+    );
+  }
+}
+
+function initFirebaseAdmin() {
+  if (admin.apps.length > 0) {
+    return admin.app();
+  }
+
+  const serviceAccount = getServiceAccountFromEnv();
+
+  return admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
+function getFirebaseServiceAccountInfo() {
+  try {
+    const serviceAccount = getServiceAccountFromEnv();
 
     return {
       ok: true,
@@ -139,10 +120,10 @@ async function verifyFirebaseUser(req) {
     throw error;
   }
 
-  const firebaseApp = initFirebaseAdmin();
+  initFirebaseAdmin();
 
   try {
-    const decodedToken = await getAuth(firebaseApp).verifyIdToken(token);
+    const decodedToken = await admin.auth().verifyIdToken(token);
 
     return {
       uid: decodedToken.uid,
