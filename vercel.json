@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/gemini-journal.js": {
+      "maxDuration": 30
+    }
+  }
+}
