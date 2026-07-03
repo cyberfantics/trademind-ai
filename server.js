@@ -5,6 +5,7 @@ const dotenv = require("dotenv");
 const { initializeApp, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 
+
 dotenv.config();
 
 const app = express();
@@ -14,6 +15,8 @@ const MAX_QUESTION_LENGTH = 2000;
 const MAX_JOURNAL_ENTRIES = 80;
 const MAX_CHAT_HISTORY_MESSAGES = 12;
 const MAX_CHAT_MESSAGE_LENGTH = 1800;
+
+const DAILY_AI_LIMIT = 5;
 
 app.use(
   cors({
@@ -76,6 +79,88 @@ function initFirebaseAdmin() {
   });
 }
 
+function getUtcDateKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getNextUtcResetIso() {
+  const now = new Date();
+
+  const nextReset = new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() + 1,
+      0,
+      0,
+      0,
+      0
+    )
+  );
+
+  return nextReset.toISOString();
+}
+
+async function checkAndConsumeDailyAiLimit(uid) {
+  const firebaseApp = initFirebaseAdmin();
+  const db = getFirestore(firebaseApp);
+
+  const dateKey = getUtcDateKey();
+
+  const ref = db
+    .collection("aiRateLimits")
+    .doc(uid)
+    .collection("daily")
+    .doc(dateKey);
+
+  return await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ref);
+
+    const currentCount = snapshot.exists
+      ? Number(snapshot.data().count || 0)
+      : 0;
+
+    if (currentCount >= DAILY_AI_LIMIT) {
+      const error = new Error(
+        `Daily AI limit reached. You can ask ${DAILY_AI_LIMIT} questions per day.`
+      );
+
+      error.statusCode = 429;
+      error.remaining = 0;
+      error.limit = DAILY_AI_LIMIT;
+      error.resetAt = getNextUtcResetIso();
+
+      throw error;
+    }
+
+    const nextCount = currentCount + 1;
+
+    transaction.set(
+      ref,
+      {
+        uid,
+        dateKey,
+        count: nextCount,
+        limit: DAILY_AI_LIMIT,
+        updatedAt: FieldValue.serverTimestamp(),
+        createdAt: snapshot.exists
+          ? snapshot.data().createdAt || FieldValue.serverTimestamp()
+          : FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      }
+    );
+
+    return {
+      limit: DAILY_AI_LIMIT,
+      used: nextCount,
+      remaining: Math.max(DAILY_AI_LIMIT - nextCount, 0),
+      resetAt: getNextUtcResetIso(),
+    };
+  });
+}
+
 function getBearerToken(req) {
   const authHeader = req.headers.authorization || "";
 
@@ -134,23 +219,38 @@ function limitText(value, maxLength) {
   return `${text.substring(0, maxLength).trim()}...`;
 }
 
-function buildChatHistoryContext(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return "No previous AI conversation found.";
+
+function limitText(value, maxLength) {
+  const text = safeText(value);
+
+  if (text.length <= maxLength) {
+    return text;
   }
 
-  return messages
-    .filter((message) => message && safeText(message.text).isNotEmpty)
-    .slice(-MAX_CHAT_HISTORY_MESSAGES)
-    .map((message, index) => {
-      const role = safeText(message.role, "unknown").toLowerCase();
-      const safeRole = role === "assistant" ? "assistant" : "user";
-      const text = limitText(message.text, MAX_CHAT_MESSAGE_LENGTH);
-
-      return `${index + 1}. ${safeRole.toUpperCase()}: ${text}`;
-    })
-    .join("\n\n");
+  return `${text.substring(0, maxLength).trim()}...`;
 }
+
+function buildPreviousContextContext(previousContext) {
+  if (!previousContext || typeof previousContext !== "object") {
+    return "No previous question and answer context.";
+  }
+
+  const previousQuestion = limitText(previousContext.question, 1000);
+  const previousAnswer = limitText(previousContext.answer, 1800);
+
+  if (!previousQuestion && !previousAnswer) {
+    return "No previous question and answer context.";
+  }
+
+  return `
+Previous user question:
+${previousQuestion || "Not available"}
+
+Previous AI answer:
+${previousAnswer || "Not available"}
+`;
+}
+
 
 function buildJournalContext(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
@@ -202,20 +302,15 @@ ${recentTrades}
 `;
 }
 
-function buildPrompt({ question, journalEntries, chatHistory, user }) {
+function buildPrompt({ question, journalEntries, previousContext, user }) {
   const hasJournalData =
     Array.isArray(journalEntries) && journalEntries.length > 0;
-
-  const hasChatHistory =
-    Array.isArray(chatHistory) && chatHistory.length > 0;
 
   const journalContext = hasJournalData
     ? buildJournalContext(journalEntries)
     : "Journal data was not sent for this follow-up message.";
 
-  const chatContext = hasChatHistory
-    ? buildChatHistoryContext(chatHistory)
-    : "No previous conversation context.";
+  const previousContextText = buildPreviousContextContext(previousContext);
 
   return `
 You are a trading journal coach inside a trader app.
@@ -228,8 +323,8 @@ Response rules:
 - Do not mention the app name unless the user asks.
 - Do not write unnecessary introduction.
 - Answer the user's latest question directly.
-- Use previous conversation context when journal data is not sent.
-- Keep continuity with previous questions and answers.
+- Use previous question and previous answer for context.
+- Keep continuity with the previous answer.
 - Do not repeat the same full analysis again unless the user asks.
 - Give a complete answer, not a half answer.
 - Use simple and clear language.
@@ -244,16 +339,16 @@ Response rules:
 Latest user question:
 ${question}
 
-Previous conversation:
-${chatContext}
+Previous context:
+${previousContextText}
 
 Journal data:
 ${journalContext}
 
 Important:
 - If journal data is present, analyze from it.
-- If journal data is not present, answer as a follow-up using previous conversation.
-- Do not invent trades, PnL, emotions, setups, or results that are not in the provided data or previous conversation.
+- If journal data is not present, answer as a follow-up using previous context.
+- Do not invent trades, PnL, emotions, setups, or results that are not in the provided data or previous context.
 
 Now give a complete and useful answer.
 `;
@@ -305,12 +400,19 @@ app.post("/api/gemini-journal", async (req, res) => {
 
     const user = await verifyFirebaseUser(req);
 
+    const rateLimit = await checkAndConsumeDailyAiLimit(user.uid);
+
     const question = safeText(req.body?.question);
 
     const journalEntries = Array.isArray(req.body?.journalEntries)
       ? req.body.journalEntries
       : [];
 
+    const previousContext =
+  req.body?.previousContext && typeof req.body.previousContext === "object"
+    ? req.body.previousContext
+    : null;
+    
     const chatHistory = Array.isArray(req.body?.chatHistory)
       ? req.body.chatHistory
       : [];
@@ -330,11 +432,11 @@ app.post("/api/gemini-journal", async (req, res) => {
     }
 
     const prompt = buildPrompt({
-      question,
-      journalEntries,
-      chatHistory,
-      user,
-    });
+  question,
+  journalEntries,
+  previousContext,
+  user,
+});
 
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
@@ -398,19 +500,29 @@ app.post("/api/gemini-journal", async (req, res) => {
     }
 
     return res.status(200).json({
-      success: true,
-      finishReason,
-      answer:
-        finishReason === "MAX_TOKENS"
-          ? `${answer}\n\nNote: The answer was cut because it reached the output limit. Please ask again with a more specific question.`
-          : answer,
-    });
+  success: true,
+  finishReason,
+  rateLimit,
+  answer:
+    finishReason === "MAX_TOKENS"
+      ? `${answer}\n\nNote: The answer was cut because it reached the output limit. Please ask again with a more specific question.`
+      : answer,
+});
+    
   } catch (error) {
-    return res.status(error.statusCode || 500).json({
-      success: false,
-      error: error.message || "Server error. Please try again.",
-    });
-  }
+  return res.status(error.statusCode || 500).json({
+    success: false,
+    error: error.message || "Server error. Please try again.",
+    rateLimit:
+      error.statusCode === 429
+        ? {
+            limit: error.limit,
+            remaining: error.remaining,
+            resetAt: error.resetAt,
+          }
+        : undefined,
+  });
+}
 });
 
 app.use((req, res) => {
