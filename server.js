@@ -1,7 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const admin = require("firebase-admin");
+
+const { initializeApp, cert, getApps } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 
 dotenv.config();
 
@@ -20,8 +22,6 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
-
-let firebaseAppReady = false;
 
 function getEnvStatus() {
   return {
@@ -73,37 +73,17 @@ function getServiceAccountFromEnv() {
 }
 
 function initFirebaseAdmin() {
-  if (firebaseAppReady) {
-    return;
-  }
+  const apps = getApps();
 
-  try {
-    admin.app();
-    firebaseAppReady = true;
-    return;
-  } catch (_) {
-    // No default app yet, so initialize below.
+  if (apps.length > 0) {
+    return apps[0];
   }
 
   const serviceAccount = getServiceAccountFromEnv();
 
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-
-    firebaseAppReady = true;
-  } catch (error) {
-    if (
-      error.message &&
-      error.message.includes("The default Firebase app already exists")
-    ) {
-      firebaseAppReady = true;
-      return;
-    }
-
-    throw error;
-  }
+  return initializeApp({
+    credential: cert(serviceAccount),
+  });
 }
 
 function getFirebaseServiceAccountInfo() {
@@ -143,10 +123,10 @@ async function verifyFirebaseUser(req) {
     throw error;
   }
 
-  initFirebaseAdmin();
+  const firebaseApp = initFirebaseAdmin();
 
   try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
+    const decodedToken = await getAuth(firebaseApp).verifyIdToken(token);
 
     return {
       uid: decodedToken.uid,
