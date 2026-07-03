@@ -4,7 +4,7 @@ const dotenv = require("dotenv");
 
 const { initializeApp, cert, getApps } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
-
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 dotenv.config();
 
@@ -219,16 +219,6 @@ function limitText(value, maxLength) {
   return `${text.substring(0, maxLength).trim()}...`;
 }
 
-
-function limitText(value, maxLength) {
-  const text = safeText(value);
-
-  if (text.length <= maxLength) {
-    return text;
-  }
-
-  return `${text.substring(0, maxLength).trim()}...`;
-}
 
 function buildPreviousContextContext(previousContext) {
   if (!previousContext || typeof previousContext !== "object") {
