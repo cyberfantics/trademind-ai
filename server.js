@@ -19,11 +19,9 @@ app.use(
   })
 );
 
-app.use(
-  express.json({
-    limit: "1mb",
-  })
-);
+app.use(express.json({ limit: "1mb" }));
+
+let firebaseAppReady = false;
 
 function getEnvStatus() {
   return {
@@ -43,44 +41,69 @@ function getServiceAccountFromEnv() {
     throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 env variable.");
   }
 
+  let serviceAccountJson;
+  let serviceAccount;
+
   try {
-    const serviceAccountJson = Buffer.from(
+    serviceAccountJson = Buffer.from(
       serviceAccountBase64,
       "base64"
     ).toString("utf8");
 
-    const serviceAccount = JSON.parse(serviceAccountJson);
-
-    if (!serviceAccount.project_id) {
-      throw new Error("Service account missing project_id.");
-    }
-
-    if (!serviceAccount.client_email) {
-      throw new Error("Service account missing client_email.");
-    }
-
-    if (!serviceAccount.private_key) {
-      throw new Error("Service account missing private_key.");
-    }
-
-    return serviceAccount;
+    serviceAccount = JSON.parse(serviceAccountJson);
   } catch (error) {
     throw new Error(
-      `FIREBASE_SERVICE_ACCOUNT_BASE64 is invalid: ${error.message}`
+      `FIREBASE_SERVICE_ACCOUNT_BASE64 is invalid Base64 JSON: ${error.message}`
     );
   }
+
+  if (!serviceAccount.project_id) {
+    throw new Error("Service account is missing project_id.");
+  }
+
+  if (!serviceAccount.client_email) {
+    throw new Error("Service account is missing client_email.");
+  }
+
+  if (!serviceAccount.private_key) {
+    throw new Error("Service account is missing private_key.");
+  }
+
+  return serviceAccount;
 }
 
 function initFirebaseAdmin() {
-  if (admin.apps.length > 0) {
-    return admin.app();
+  if (firebaseAppReady) {
+    return;
+  }
+
+  try {
+    admin.app();
+    firebaseAppReady = true;
+    return;
+  } catch (_) {
+    // No default app yet, so initialize below.
   }
 
   const serviceAccount = getServiceAccountFromEnv();
 
-  return admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+
+    firebaseAppReady = true;
+  } catch (error) {
+    if (
+      error.message &&
+      error.message.includes("The default Firebase app already exists")
+    ) {
+      firebaseAppReady = true;
+      return;
+    }
+
+    throw error;
+  }
 }
 
 function getFirebaseServiceAccountInfo() {
