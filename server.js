@@ -12,6 +12,8 @@ const PORT = process.env.PORT || 3000;
 
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_JOURNAL_ENTRIES = 80;
+const MAX_CHAT_HISTORY_MESSAGES = 12;
+const MAX_CHAT_MESSAGE_LENGTH = 1800;
 
 app.use(
   cors({
@@ -27,53 +29,37 @@ app.use(
   })
 );
 
-function getEnvStatus() {
-  return {
-    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
-    hasFirebaseServiceAccount: Boolean(
-      process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
-    ),
-    geminiModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-    allowedOrigin: process.env.ALLOWED_ORIGIN || "*",
-  };
-}
-
 function getServiceAccountFromEnv() {
   const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
   if (!serviceAccountBase64) {
-    throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 env variable.");
+    throw new Error("Server Firebase configuration is missing.");
   }
 
-  let serviceAccountJson;
-  let serviceAccount;
-
   try {
-    serviceAccountJson = Buffer.from(
+    const serviceAccountJson = Buffer.from(
       serviceAccountBase64,
       "base64"
     ).toString("utf8");
 
-    serviceAccount = JSON.parse(serviceAccountJson);
+    const serviceAccount = JSON.parse(serviceAccountJson);
+
+    if (!serviceAccount.project_id) {
+      throw new Error("Firebase service account project_id is missing.");
+    }
+
+    if (!serviceAccount.client_email) {
+      throw new Error("Firebase service account client_email is missing.");
+    }
+
+    if (!serviceAccount.private_key) {
+      throw new Error("Firebase service account private_key is missing.");
+    }
+
+    return serviceAccount;
   } catch (error) {
-    throw new Error(
-      `FIREBASE_SERVICE_ACCOUNT_BASE64 is invalid Base64 JSON: ${error.message}`
-    );
+    throw new Error("Server Firebase configuration is invalid.");
   }
-
-  if (!serviceAccount.project_id) {
-    throw new Error("Service account is missing project_id.");
-  }
-
-  if (!serviceAccount.client_email) {
-    throw new Error("Service account is missing client_email.");
-  }
-
-  if (!serviceAccount.private_key) {
-    throw new Error("Service account is missing private_key.");
-  }
-
-  return serviceAccount;
 }
 
 function initFirebaseAdmin() {
@@ -90,24 +76,6 @@ function initFirebaseAdmin() {
   });
 }
 
-function getFirebaseServiceAccountInfo() {
-  try {
-    const serviceAccount = getServiceAccountFromEnv();
-
-    return {
-      ok: true,
-      projectId: serviceAccount.project_id || null,
-      clientEmail: serviceAccount.client_email || null,
-      hasPrivateKey: Boolean(serviceAccount.private_key),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error.message,
-    };
-  }
-}
-
 function getBearerToken(req) {
   const authHeader = req.headers.authorization || "";
 
@@ -122,7 +90,7 @@ async function verifyFirebaseUser(req) {
   const token = getBearerToken(req);
 
   if (!token) {
-    const error = new Error("No Authorization Bearer token received by backend.");
+    const error = new Error("Authentication token is missing.");
     error.statusCode = 401;
     throw error;
   }
@@ -135,24 +103,11 @@ async function verifyFirebaseUser(req) {
     return {
       uid: decodedToken.uid,
       email: decodedToken.email || null,
-      aud: decodedToken.aud || null,
-      iss: decodedToken.iss || null,
-      authTime: decodedToken.auth_time || null,
     };
-  } catch (error) {
-    console.error("Firebase token verification failed:", {
-      code: error.code,
-      message: error.message,
-    });
-
-    const customError = new Error(
-      `Firebase token verification failed: ${error.code || ""} ${
-        error.message || ""
-      }`.trim()
-    );
-
-    customError.statusCode = 401;
-    throw customError;
+  } catch (_) {
+    const error = new Error("Authentication failed. Please login again.");
+    error.statusCode = 401;
+    throw error;
   }
 }
 
@@ -169,9 +124,37 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(num) ? num : fallback;
 }
 
+function limitText(value, maxLength) {
+  const text = safeText(value);
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.substring(0, maxLength).trim()}...`;
+}
+
+function buildChatHistoryContext(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return "No previous AI conversation found.";
+  }
+
+  return messages
+    .filter((message) => message && safeText(message.text).isNotEmpty)
+    .slice(-MAX_CHAT_HISTORY_MESSAGES)
+    .map((message, index) => {
+      const role = safeText(message.role, "unknown").toLowerCase();
+      const safeRole = role === "assistant" ? "assistant" : "user";
+      const text = limitText(message.text, MAX_CHAT_MESSAGE_LENGTH);
+
+      return `${index + 1}. ${safeRole.toUpperCase()}: ${text}`;
+    })
+    .join("\n\n");
+}
+
 function buildJournalContext(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
-    return "No journal entries found for this user yet.";
+    return "No journal entries were sent for this message.";
   }
 
   const cleanEntries = entries.slice(0, MAX_JOURNAL_ENTRIES);
@@ -219,8 +202,20 @@ ${recentTrades}
 `;
 }
 
-function buildPrompt({ question, journalEntries, user }) {
-  const journalContext = buildJournalContext(journalEntries);
+function buildPrompt({ question, journalEntries, chatHistory, user }) {
+  const hasJournalData =
+    Array.isArray(journalEntries) && journalEntries.length > 0;
+
+  const hasChatHistory =
+    Array.isArray(chatHistory) && chatHistory.length > 0;
+
+  const journalContext = hasJournalData
+    ? buildJournalContext(journalEntries)
+    : "Journal data was not sent for this follow-up message.";
+
+  const chatContext = hasChatHistory
+    ? buildChatHistoryContext(chatHistory)
+    : "No previous conversation context.";
 
   return `
 You are a trading journal coach inside a trader app.
@@ -232,25 +227,33 @@ Response rules:
 - Do not introduce yourself.
 - Do not mention the app name unless the user asks.
 - Do not write unnecessary introduction.
-- Answer the user's exact question directly.
+- Answer the user's latest question directly.
+- Use previous conversation context when journal data is not sent.
+- Keep continuity with previous questions and answers.
+- Do not repeat the same full analysis again unless the user asks.
 - Give a complete answer, not a half answer.
 - Use simple and clear language.
 - Use short sections with headings.
 - Use bullet points where helpful.
-- Make the answer detailed enough that the user can understand and take action.
-- Do not make the answer too short if the question needs explanation.
 - Do not promise profit.
 - Do not give guaranteed financial advice.
 - Give educational trading journal analysis only.
-- Analyze only from the journal data provided.
 - If data is missing, clearly say what data is missing.
-- Focus on discipline, risk management, emotions, mistakes, setups, patterns, consistency, and journaling quality.
+- If the user asks something that needs fresh journal data and journal data was not sent, tell them to refresh journal analysis first.
 
-User question:
+Latest user question:
 ${question}
 
-User journal data:
+Previous conversation:
+${chatContext}
+
+Journal data:
 ${journalContext}
+
+Important:
+- If journal data is present, analyze from it.
+- If journal data is not present, answer as a follow-up using previous conversation.
+- Do not invent trades, PnL, emotions, setups, or results that are not in the provided data or previous conversation.
 
 Now give a complete and useful answer.
 `;
@@ -277,8 +280,6 @@ app.get("/", (req, res) => {
     routes: {
       health: "/health",
       geminiJournal: "/api/gemini-journal",
-      firebaseDebug: "/debug/firebase",
-      tokenDebug: "/debug/check-token",
     },
   });
 });
@@ -287,48 +288,7 @@ app.get("/health", (req, res) => {
   return res.status(200).json({
     success: true,
     status: "ok",
-    env: getEnvStatus(),
   });
-});
-
-app.get("/debug/firebase", (req, res) => {
-  const info = getFirebaseServiceAccountInfo();
-
-  return res.status(info.ok ? 200 : 500).json({
-    success: info.ok,
-    firebase: info,
-    env: getEnvStatus(),
-  });
-});
-
-app.post("/debug/check-token", async (req, res) => {
-  try {
-    const token = getBearerToken(req);
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: "No Authorization Bearer token received by backend.",
-        hasAuthorizationHeader: Boolean(req.headers.authorization),
-        receivedAuthorizationHeaderStart: req.headers.authorization
-          ? req.headers.authorization.substring(0, 20)
-          : null,
-      });
-    }
-
-    const user = await verifyFirebaseUser(req);
-
-    return res.status(200).json({
-      success: true,
-      message: "Firebase token is valid.",
-      user,
-    });
-  } catch (error) {
-    return res.status(error.statusCode || 401).json({
-      success: false,
-      error: error.message,
-    });
-  }
 });
 
 app.post("/api/gemini-journal", async (req, res) => {
@@ -339,15 +299,20 @@ app.post("/api/gemini-journal", async (req, res) => {
     if (!apiKey) {
       return res.status(500).json({
         success: false,
-        error: "Server is missing GEMINI_API_KEY environment variable.",
+        error: "AI server configuration is missing.",
       });
     }
 
     const user = await verifyFirebaseUser(req);
 
     const question = safeText(req.body?.question);
+
     const journalEntries = Array.isArray(req.body?.journalEntries)
       ? req.body.journalEntries
+      : [];
+
+    const chatHistory = Array.isArray(req.body?.chatHistory)
+      ? req.body.chatHistory
       : [];
 
     if (!question) {
@@ -367,6 +332,7 @@ app.post("/api/gemini-journal", async (req, res) => {
     const prompt = buildPrompt({
       question,
       journalEntries,
+      chatHistory,
       user,
     });
 
@@ -407,18 +373,17 @@ app.post("/api/gemini-journal", async (req, res) => {
 
     try {
       data = await geminiResponse.json();
-    } catch (error) {
+    } catch (_) {
       return res.status(502).json({
         success: false,
-        error: "Gemini returned invalid JSON.",
+        error: "AI returned an invalid response.",
       });
     }
 
     if (!geminiResponse.ok) {
       return res.status(geminiResponse.status).json({
         success: false,
-        error: "Gemini request failed.",
-        details: data,
+        error: "AI request failed. Please try again.",
       });
     }
 
@@ -428,14 +393,12 @@ app.post("/api/gemini-journal", async (req, res) => {
     if (!answer) {
       return res.status(502).json({
         success: false,
-        error: "Gemini returned an empty answer.",
-        finishReason,
+        error: "AI returned an empty answer.",
       });
     }
 
     return res.status(200).json({
       success: true,
-      userId: user.uid,
       finishReason,
       answer:
         finishReason === "MAX_TOKENS"
@@ -445,7 +408,7 @@ app.post("/api/gemini-journal", async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      error: error.message || "Internal server error.",
+      error: error.message || "Server error. Please try again.",
     });
   }
 });
@@ -454,10 +417,7 @@ app.use((req, res) => {
   return res.status(404).json({
     success: false,
     error: "Route not found.",
-    path: req.path,
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`TradeMind AI backend running on port ${PORT}`);
-});
+app.listen(PORT, () => {});
